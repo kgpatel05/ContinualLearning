@@ -96,3 +96,42 @@ def build_cifar10_cil_stream(
             meta=None,
         ))
     return stream
+
+
+def build_class_incremental_stream(
+    train_dataset, #assumes the format of (x,y) where y is the class label
+    test_dataset,
+    n_experiences,
+    num_classes,
+    class_order,
+    seed
+) -> List[Experience]:
+    # TODO
+    pass
+
+def build_domain_incremental_stream(
+    datasets_list, #each dataset is one domain/experience, can be used for a multidomain scenarios
+    domain_names
+) -> List[Experience]:
+    pass
+
+def build_custom_stream(
+    train_datasets_list,
+    test_datasets_list,
+    classes_per_exp,
+    mata_list
+) -> List[Experience]:
+    pass
+
+def split_dataset_by_indices(
+    dataset,
+    indices_per_split
+) -> List[Dataset]:
+    pass
+
+def get_class_indices(
+    dataset,
+    target_classes,
+    label_fn
+) -> List[int]:
+    pass

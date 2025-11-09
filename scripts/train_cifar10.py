@@ -10,7 +10,7 @@ Wire-up script for the MVP:
 
 from lightning.fabric import Fabric
 
-from ContinualLearning import (
+from clx_mvp import (
     build_cifar10_cil_stream,
     build_resnet18,
     ERBuffer,
