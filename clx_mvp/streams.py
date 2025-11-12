@@ -185,7 +185,13 @@ def split_dataset_by_indices(
         A list of `torch.utils.data.Subset` objects, one for each
         index sequence in `indices_per_split`.
     """
-    ...
+    subsets = []
+
+    for idxs in indices_per_split:
+        subset = Subset(dataset, idxs):
+        subsets.append(subset)
+    
+    return subsets
 
 
 def get_class_indices(
