@@ -99,21 +99,67 @@ def build_cifar10_cil_stream(
 
 
 def build_class_incremental_stream(
-    train_dataset, #assumes the format of (x,y) where y is the class label
-    test_dataset,
-    n_experiences,
-    num_classes,
-    class_order,
-    seed
-) -> List[Experience]:
-    # TODO
-    pass
+    train_ds,
+    test_ds,
+    num_classes: int,
+    n_experiences: int,
+    class_order: Optional[list[int]] = None,
+    label_fn: Callable = lambda ex: ex[1],
+) -> list[Experience]:
+    """
+    Generic builder for class-incremental (Class-IL) streams.
+
+    The label space {0, ..., num_classes-1} is partitioned into
+    `n_experiences` chunks (the last chunk may be uneven), and for each
+    chunk an `Experience` is created containing only those classes.
+
+    Args:
+        train_ds: Training dataset (e.g., CIFAR-10 train split) whose labels
+            are obtained via `label_fn`.
+        test_ds: Test dataset, with the same label space and `label_fn` as
+            `train_ds`.
+        num_classes: Total number of distinct classes in the label space.
+        n_experiences: Desired number of incremental experiences.
+        class_order: Optional permutation of [0, ..., num_classes-1] that
+            fixes the order in which classes appear across experiences. If
+            None, the natural order is used.
+        label_fn: Function that extracts a label from a dataset example
+            (e.g., lambda ex: ex[1] for (x, y) tuples).
+
+    Returns:
+        A list of `Experience` objects in chronological order (exp_id
+        increasing), each representing a chunk of classes.
+    """
+    ...
+
 
 def build_domain_incremental_stream(
-    datasets_list, #each dataset is one domain/experience, can be used for a multidomain scenarios
-    domain_names
-) -> List[Experience]:
-    pass
+    domain_train_datasets: list[Dataset],
+    domain_test_datasets: list[Dataset],
+    domain_names: Optional[list[str]] = None,
+    label_fn: Callable = lambda ex: ex[1],
+) -> list[Experience]:
+    """
+    Build a domain-incremental (Domain-IL) stream, where each experience
+    corresponds to a separate domain (dataset pair) but shares the same
+    label space.
+
+    Args:
+        domain_train_datasets: List of training datasets, one per domain.
+        domain_test_datasets: List of test datasets, aligned with
+            `domain_train_datasets` by position.
+        domain_names: Optional list of names (one per domain) that will be
+            stored in each Experience's meta["domain"]. If None, generic
+            names like "domain_0" are used.
+        label_fn: Function that extracts a label from a dataset example
+            for discovering the set of classes present in each domain.
+
+    Returns:
+        A list of `Experience` objects, one per domain, each containing the
+        corresponding train/test datasets and the sorted set of classes
+        observed in that domain.
+    """
+    ...
 
 def build_custom_stream(
     train_datasets_list,
@@ -126,12 +172,49 @@ def build_custom_stream(
 def split_dataset_by_indices(
     dataset,
     indices_per_split
-) -> List[Dataset]:
-    pass
+) -> list[Subset]:
+    """
+    Create a list of `Subset` views on `dataset`, one per list of indices.
+
+    Args:
+        dataset: Base dataset to be split.
+        indices_per_split: Iterable of index collections, where each element
+            is a sequence (e.g., list) of integer indices into `dataset`.
+
+    Returns:
+        A list of `torch.utils.data.Subset` objects, one for each
+        index sequence in `indices_per_split`.
+    """
+    ...
+
 
 def get_class_indices(
     dataset,
     target_classes,
-    label_fn
-) -> List[int]:
-    pass
+    label_fn: Callable
+) -> list[int]:
+    """
+    Return the indices of all examples in `dataset` whose label is in
+    `target_classes`.
+
+    Args:
+        dataset: Dataset providing examples, typically returning (x, y) or
+            some structure that `label_fn` can consume.
+        target_classes: Iterable of integer class ids to keep.
+        label_fn: Callable that, given a dataset example (e.g., dataset[i]),
+            returns its label as an int (or something convertible to int).
+
+    Returns:
+        List of integer indices i such that label_fn(dataset[i]) is one of
+        the target_classes.
+    """
+    matching_indices = []
+
+    for i in range(len(dataset)):
+        label = label_fn(dataset[i]):
+        label = int(label)
+        if label in target_classes:
+            matching_indices.append(i)
+
+
+    return matching_indices
