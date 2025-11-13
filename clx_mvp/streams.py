@@ -1,7 +1,7 @@
 # clx_mvp/streams.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Dict, Any, Sequence, Tuple, Optional
+from typing import List, Dict, Any, Sequence, Tuple, Optional, Callable
 
 import random
 import torch
@@ -130,7 +130,40 @@ def build_class_incremental_stream(
         A list of `Experience` objects in chronological order (exp_id
         increasing), each representing a chunk of classes.
     """
-    ...
+    if class_order is None:
+        class_order = list(range(num_classes))
+
+    assert len(class_order) == num_classes
+
+    # Compute how many classes per experience to ensure that we cover all classes even if num_classes is not divisible
+    # by n_experiences; the last exp may have fewer classes.
+    chunk = (num_classes + n_experiences - 1) // n_experiences
+
+    experiences: List[Experience] = []
+
+    for k in range(n_experiences):
+        cls = class_order[k * chunk:(k+1)*chunk]
+
+        if not cls:
+            break
+
+        train_ind = get_class_indices(train_ds, cls, label_fn)
+        test_ind = get_class_indices(test_ds, cls, label_fn)
+
+        train_subset = Subset(train_ds, train_ind)
+        test_subset = Subset(test_ds, test_ind)
+
+        exp = Experience(
+            exp_id = k,
+            train_ds = train_subset,
+            test_ds = test_subset,
+            classes = cls,
+            meta = {"type": "class-il"},
+        )
+
+        experiences.append(exp)
+
+    return experiences
 
 
 def build_domain_incremental_stream(
@@ -141,33 +174,111 @@ def build_domain_incremental_stream(
 ) -> list[Experience]:
     """
     Build a domain-incremental (Domain-IL) stream, where each experience
-    corresponds to a separate domain (dataset pair) but shares the same
-    label space.
+    corresponds to a separate domain (dataset pair) but shares (conceptually)
+    the same label space.
 
-    Args:
-        domain_train_datasets: List of training datasets, one per domain.
-        domain_test_datasets: List of test datasets, aligned with
-            `domain_train_datasets` by position.
-        domain_names: Optional list of names (one per domain) that will be
-            stored in each Experience's meta["domain"]. If None, generic
-            names like "domain_0" are used.
-        label_fn: Function that extracts a label from a dataset example
-            for discovering the set of classes present in each domain.
-
-    Returns:
-        A list of `Experience` objects, one per domain, each containing the
-        corresponding train/test datasets and the sorted set of classes
-        observed in that domain.
+    Each domain gets its own Experience, and for each one we also discover
+    which classes actually appear in its training set.
     """
-    ...
+    # Each train dataset must have a corresponding test dataset.
+    assert len(domain_train_datasets) == len(domain_test_datasets), \
+        "domain_train_datasets and domain_test_datasets must have same length."
+
+    # If domain_names are provided, they must match the number of domains.
+    if domain_names is not None:
+        assert len(domain_names) == len(domain_train_datasets), \
+            "domain_names must match number of domains."
+
+    experiences: list[Experience] = []
+
+    for k, (tr, te) in enumerate(zip(domain_train_datasets, domain_test_datasets)):
+        # Discover which classes appear in this domain by scanning the train set.
+        seen_classes: set[int] = set()
+        for i in range(len(tr)):
+            y = label_fn(tr[i])
+            seen_classes.add(int(y))
+
+        # Stable, sorted list of classes for this domain.
+        classes_in_domain = sorted(seen_classes)
+
+        # Choose a domain name, either user-provided or a fallback.
+        if domain_names is not None:
+            domain_name = domain_names[k]
+        else:
+            domain_name = f"domain_{k}"
+
+        exp = Experience(
+            exp_id=k,
+            train_ds=tr,
+            test_ds=te,
+            classes=classes_in_domain,
+            meta={
+                "type": "domain-il",
+                "domain": domain_name,
+            },
+        )
+        experiences.append(exp)
+
+    return experiences
 
 def build_custom_stream(
     train_datasets_list,
     test_datasets_list,
     classes_per_exp,
-    mata_list
+    mata_list=None,
 ) -> List[Experience]:
-    pass
+    """
+    Build a custom stream where the user provides per-experience datasets,
+    classes, and (optionally) meta information.
+
+    Args:
+        train_datasets_list: Sequence of training datasets, one per experience.
+        test_datasets_list: Sequence of test datasets, aligned with
+            train_datasets_list by position.
+        classes_per_exp: Sequence where each element is the list (or iterable)
+            of class IDs associated with that experience.
+        mata_list: Optional sequence of meta dicts (or None). If provided,
+            mata_list[k] is stored as the `meta` field of experience k.
+            If None, a default meta dict is used.
+
+    Returns:
+        List[Experience]: one Experience per (train, test, classes) triple.
+    """
+    n_exps = len(train_datasets_list)
+
+    # Basic consistency checks.
+    assert len(test_datasets_list) == n_exps, \
+        "test_datasets_list must have same length as train_datasets_list."
+    assert len(classes_per_exp) == n_exps, \
+        "classes_per_exp must have same length as train_datasets_list."
+
+    if mata_list is not None:
+        assert len(mata_list) == n_exps, \
+            "mata_list must have same length as train_datasets_list."
+
+    experiences: List[Experience] = []
+
+    for k in range(n_exps):
+        train_ds = train_datasets_list[k]
+        test_ds = test_datasets_list[k]
+        cls = list(classes_per_exp[k])
+
+        if mata_list is not None:
+            meta = mata_list[k]
+        else:
+            meta = {"type": "custom", "exp_id": k}
+
+        exp = Experience(
+            exp_id=k,
+            train_ds=train_ds,
+            test_ds=test_ds,
+            classes=cls,
+            meta=meta,
+        )
+        experiences.append(exp)
+
+    return experiences
+
 
 def split_dataset_by_indices(
     dataset,
@@ -188,7 +299,7 @@ def split_dataset_by_indices(
     subsets = []
 
     for idxs in indices_per_split:
-        subset = Subset(dataset, idxs):
+        subset = Subset(dataset, idxs)
         subsets.append(subset)
     
     return subsets
@@ -214,13 +325,13 @@ def get_class_indices(
         List of integer indices i such that label_fn(dataset[i]) is one of
         the target_classes.
     """
-    matching_indices = []
+    matching_indices: list[int] = []
+    target_set = set(int(c) for c in target_classes)
 
     for i in range(len(dataset)):
-        label = label_fn(dataset[i]):
+        label = label_fn(dataset[i])
         label = int(label)
-        if label in target_classes:
+        if label in target_set:
             matching_indices.append(i)
-
 
     return matching_indices
