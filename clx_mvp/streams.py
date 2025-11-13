@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Sequence, Tuple, Optional, Callable
 
 import random
-import torch
 from torch.utils.data import Dataset, Subset
 from torchvision import datasets, transforms
 
@@ -225,7 +224,7 @@ def build_custom_stream(
     train_datasets_list,
     test_datasets_list,
     classes_per_exp,
-    mata_list=None,
+    meta_list=None,
 ) -> List[Experience]:
     """
     Build a custom stream where the user provides per-experience datasets,
@@ -246,15 +245,15 @@ def build_custom_stream(
     """
     n_exps = len(train_datasets_list)
 
-    # Basic consistency checks.
+    #basic consistency checks.
     assert len(test_datasets_list) == n_exps, \
         "test_datasets_list must have same length as train_datasets_list."
     assert len(classes_per_exp) == n_exps, \
         "classes_per_exp must have same length as train_datasets_list."
 
-    if mata_list is not None:
-        assert len(mata_list) == n_exps, \
-            "mata_list must have same length as train_datasets_list."
+    if meta_list is not None:
+        assert len(meta_list) == n_exps, \
+            "meta_list must have same length as train_datasets_list."
 
     experiences: List[Experience] = []
 
@@ -263,8 +262,8 @@ def build_custom_stream(
         test_ds = test_datasets_list[k]
         cls = list(classes_per_exp[k])
 
-        if mata_list is not None:
-            meta = mata_list[k]
+        if meta_list is not None:
+            meta = meta_list[k]
         else:
             meta = {"type": "custom", "exp_id": k}
 
