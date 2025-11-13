@@ -52,9 +52,52 @@ def build_cifar10_cil_stream(
     Raises:
         ValueError: if 10 % n_experiences != 0
     """
-    if 10 % n_experiences != 0:
-        raise ValueError("For MVP, n_experiences must divide 10 (e.g., 5, 2, 10).")
+    # if 10 % n_experiences != 0:
+    #     raise ValueError("For MVP, n_experiences must divide 10 (e.g., 5, 2, 10).")
 
+    # # default transforms
+    # if train_transform is None:
+    #     train_transform = transforms.Compose([
+    #         transforms.RandomCrop(32, padding=4),
+    #         transforms.RandomHorizontalFlip(),
+    #         transforms.ToTensor(),
+    #     ])
+    # if test_transform is None:
+    #     test_transform = transforms.Compose([transforms.ToTensor()])
+
+    # train = datasets.CIFAR10(data_root, train=True,  download=True, transform=train_transform)
+    # test  = datasets.CIFAR10(data_root, train=False, download=True, transform=test_transform)
+
+    # # partition classes → experiences
+    # classes = list(range(10))
+    # random.Random(seed).shuffle(classes)
+    # per = 10 // n_experiences
+    # buckets: List[List[int]] = [classes[i:i+per] for i in range(0, 10, per)]
+
+    # def idxs_for(ds: Dataset, allowed: Sequence[int]) -> List[int]:
+    #     idx = []
+    #     for i in range(len(ds)):
+    #         # torchvision CIFAR returns (img, label)
+    #         _, y = ds[i]
+    #         if y in allowed:
+    #             idx.append(i)
+    #     return idx
+
+    # stream: List[Experience] = []
+    # for exp_id, cls_group in enumerate(buckets):
+    #     tr_idx = idxs_for(train, cls_group)
+    #     te_idx = idxs_for(test,  cls_group)
+    #     stream.append(Experience(
+    #         exp_id=exp_id,
+    #         train_ds=Subset(train, tr_idx),
+    #         test_ds=Subset(test, te_idx),
+    #         classes=list(cls_group),
+    #         meta=None,
+    #     ))
+    # return stream
+    """
+    Build a class-incremental CIFAR-10 stream via the generic Class-IL builder.
+    """
     # default transforms
     if train_transform is None:
         train_transform = transforms.Compose([
@@ -68,33 +111,19 @@ def build_cifar10_cil_stream(
     train = datasets.CIFAR10(data_root, train=True,  download=True, transform=train_transform)
     test  = datasets.CIFAR10(data_root, train=False, download=True, transform=test_transform)
 
-    # partition classes → experiences
-    classes = list(range(10))
-    random.Random(seed).shuffle(classes)
-    per = 10 // n_experiences
-    buckets: List[List[int]] = [classes[i:i+per] for i in range(0, 10, per)]
+    # determine class order
+    class_order = list(range(10))
+    random.Random(seed).shuffle(class_order)
 
-    def idxs_for(ds: Dataset, allowed: Sequence[int]) -> List[int]:
-        idx = []
-        for i in range(len(ds)):
-            # torchvision CIFAR returns (img, label)
-            _, y = ds[i]
-            if y in allowed:
-                idx.append(i)
-        return idx
-
-    stream: List[Experience] = []
-    for exp_id, cls_group in enumerate(buckets):
-        tr_idx = idxs_for(train, cls_group)
-        te_idx = idxs_for(test,  cls_group)
-        stream.append(Experience(
-            exp_id=exp_id,
-            train_ds=Subset(train, tr_idx),
-            test_ds=Subset(test, te_idx),
-            classes=list(cls_group),
-            meta=None,
-        ))
-    return stream
+    # now delegate to the generic builder
+    return build_class_incremental_stream(
+        train_ds=train,
+        test_ds=test,
+        num_classes=10,
+        n_experiences=n_experiences,
+        class_order=class_order,
+        label_fn=lambda ex: ex[1],
+    )
 
 
 def build_class_incremental_stream(
@@ -236,8 +265,8 @@ def build_custom_stream(
             train_datasets_list by position.
         classes_per_exp: Sequence where each element is the list (or iterable)
             of class IDs associated with that experience.
-        mata_list: Optional sequence of meta dicts (or None). If provided,
-            mata_list[k] is stored as the `meta` field of experience k.
+        meta_list: Optional sequence of meta dicts (or None). If provided,
+            meta_list[k] is stored as the `meta` field of experience k.
             If None, a default meta dict is used.
 
     Returns:
