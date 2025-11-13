@@ -1,13 +1,4 @@
 # train_cifar10.py
-"""
-Wire-up script for the MVP:
-- builds CIFAR-10 class-IL stream (5 experiences)
-- ResNet-18 model (10-way head)
-- ER buffer
-- Fabric learner
-- trains & prints per-experience accuracy + AA
-"""
-
 from lightning.fabric import Fabric
 
 from clx_mvp import (
