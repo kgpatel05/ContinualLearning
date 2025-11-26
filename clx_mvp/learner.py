@@ -1,9 +1,10 @@
 # clx_mvp/learner.py
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import os
+import time
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -12,6 +13,7 @@ from lightning.fabric import Fabric
 from .streams import Experience
 from .replay import ERBuffer
 from .metrics import accuracy, average_accuracy
+from .strategies import CLStrategy, ERStrategy
 
 @dataclass
 class FitReport:
@@ -51,6 +53,7 @@ class Learner:
         weight_decay: float = 5e-4,
         momentum: float = 0.9,
         replay_ratio: float = 0.5,
+        strategy: Optional[CLStrategy] = None,
         batch_size: int = 128,
         epochs: int = 1,
         num_workers: int = 2,
@@ -64,6 +67,7 @@ class Learner:
             buffer: ERBuffer instance
             lr, weight_decay, momentum: SGD hyperparameters
             replay_ratio: proportion of each batch to draw from buffer (0..1)
+            strategy: CLStrategy implementation; defaults to ERStrategy(replay_ratio)
             batch_size: batch size per DataLoader on this process
             epochs: number of epochs per experience
             num_workers: DataLoader workers
@@ -86,6 +90,8 @@ class Learner:
         self.epochs = int(epochs)
         self.num_workers = int(num_workers)
         self.pin_memory = bool(pin_memory)
+        self.strategy: CLStrategy = strategy or ERStrategy(replay_ratio=replay_ratio)
+        self._last_exp_stats: List[Dict[str, Any]] = []
 
     # ---- public API ----
 
@@ -107,8 +113,10 @@ class Learner:
         checkpoints: List[str] = []
 
         for exp in stream:
+            self.strategy.before_experience(self, exp)
             tr_loader, te_loader = self._make_loaders(exp)
-            self._train_one_experience(tr_loader)
+            stats = self._train_one_experience(tr_loader, exp_id=exp.exp_id)
+            self.strategy.after_experience(self, exp)
             acc = accuracy(self.model, te_loader, self.fabric)
             per_exp_acc.append(acc)
             self.fabric.print(f"[Exp {exp.exp_id}] classes={exp.classes} acc={acc:.2f}% AA={average_accuracy(per_exp_acc):.2f}%")
@@ -182,40 +190,53 @@ class Learner:
         test_loader = self.fabric.setup_dataloaders(test_loader)
         return train_loader, test_loader
 
-    def _train_one_experience(self, train_loader: DataLoader) -> None:
+    def _train_one_experience(self, train_loader: DataLoader, exp_id: Optional[int] = None) -> dict[str, Any]:
         """
-        One training epoch block for the current experience.
+        One training block for the current experience.
+        Returns a dict with efficiency stats.
 
         Behavior:
-            - For each batch, optionally draws replay samples and concatenates.
-            - Computes CE loss, backward, step.
-            - Admits only the *current* batch samples into the buffer.
+            - Delegates per-batch augmentation/replay to strategy hooks.
+            - Computes loss via strategy, backward, step.
+            - Admits only the current batch samples into the buffer.
         """
         self.model.train()
+        num_updates = 0
+        t0 = time.perf_counter()
 
         for _ in range(self.epochs):
             for x, y in train_loader:
-                # sample replay
-                r_k = int(self.replay_ratio * x.size(0))
-                rx, ry = self.buffer.sample(r_k)
-                if rx is not None:
-                    # move sampled CPU tensors to the same device as x
-                    rx = rx.to(x.device, non_blocking=True)
-                    ry = ry.to(y.device, non_blocking=True)
-                    cur_x, cur_y = x, y
-                    x = torch.cat([cur_x, rx], dim=0)
-                    y = torch.cat([cur_y, ry], dim=0)
+                x, y = self.strategy.before_batch(self, x, y)
 
-                # forward/backward
                 logits = self.model(x)
-                loss = self.criterion(logits, y)
+                loss = self.strategy.loss(self, logits, y)
                 self.optimizer.zero_grad(set_to_none=True)
                 self.fabric.backward(loss)
                 self.optimizer.step()
+                num_updates += 1
 
-                # admit *only* current samples (exclude replay tail if present)
-                if rx is not None:
-                    b_cur = cur_x.size(0)
-                    self.buffer.add(cur_x.detach(), cur_y.detach())
+                cur_batch = getattr(self, "_current_batch_for_buffer", None)
+                if cur_batch is None:
+                    cur_batch = (x.detach(), y.detach())
+
+                if isinstance(cur_batch, tuple) and len(cur_batch) == 3:
+                    cur_x, cur_y, scores = cur_batch
+                    try:
+                        self.buffer.add(cur_x, cur_y, scores=scores)
+                    except TypeError:
+                        self.buffer.add(cur_x, cur_y)
                 else:
-                    self.buffer.add(x.detach(), y.detach())
+                    cur_x, cur_y = cur_batch
+                    self.buffer.add(cur_x, cur_y)
+
+                self._current_batch_for_buffer = None
+
+        t1 = time.perf_counter()
+        stats = {
+            "exp_id": exp_id,
+            "num_updates": num_updates,
+            "train_time_sec": t1 - t0,
+            "buffer_size": len(self.buffer),
+        }
+        self._last_exp_stats.append(stats)
+        return stats
