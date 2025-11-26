@@ -83,31 +83,41 @@ def average_accuracy(acc_after_exp: Sequence[float]) -> float:
 
 def compute_forgetting(acc_matrix: List[List[float]]) -> List[float]:
     """
-    Compute forgetting per experience from an accuracy matrix.
+    Compute forgetting per task from an accuracy matrix.
 
-    Inputs:
-        acc_matrix: 2D list where acc_matrix[i][t] is accuracy on experience i
-                    measured *after training experience t* (i <= t).
-                    For MVP you may only fill diagonal entries; full forgetting
-                    requires evaluating past exps after each new one.
+    The matrix structure is:
+        acc_matrix[i][j] = accuracy on task j after training experience i
+        (rows can be ragged: row i has length i+1)
+
+    Forgetting for task j is:
+        max_{i>=j} acc_matrix[i][j] - acc_matrix[T][j]
+    where T is the final experience index.
+
+    Args:
+        acc_matrix: 2D list where acc_matrix[i][j] is accuracy on task j
+                    measured after training experience i (j <= i).
 
     Returns:
-        List[float]: forgetting[i] = max_{t>=i} acc_matrix[i][t] - acc_matrix[i][T],
-                     where T = last training experience index.
-                     If only diagonal is available, returns zeros (no info).
+        List[float]: forgetting[j] is the forgetting for task j,
+                     measured as (peak accuracy - final accuracy).
     """
     if not acc_matrix:
         return []
 
-    T = len(acc_matrix) - 1
-    forgetting = []
-    for i, row in enumerate(acc_matrix):
-        # row length can vary; consider values from i..len(row)-1
-        tail = row[i:] if len(row) > i else []
-        if len(tail) == 0:
+    n_exps = len(acc_matrix)
+    n_tasks = len(acc_matrix[-1])  # number of tasks seen at the end
+
+    forgetting: List[float] = []
+    for j in range(n_tasks):
+        # Collect all accuracies for task j across experiences where it's evaluated
+        acc_j = [acc_matrix[i][j] for i in range(n_exps) if j < len(acc_matrix[i])]
+        
+        if not acc_j:
             forgetting.append(0.0)
-        else:
-            best = max(tail)
-            final = tail[-1]
-            forgetting.append(max(0.0, best - final))
+            continue
+        
+        max_acc = max(acc_j)
+        final_acc = acc_j[-1]  # last evaluation of task j
+        forgetting.append(max(0.0, max_acc - final_acc))
+    
     return forgetting
