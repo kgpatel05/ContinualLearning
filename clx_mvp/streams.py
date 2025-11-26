@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import List, Dict, Any, Sequence, Tuple, Optional, Callable
 
 import random
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Subset, ConcatDataset
 from torchvision import datasets, transforms
 
 # ---- Public types ----
@@ -124,6 +124,60 @@ def build_cifar10_cil_stream(
         class_order=class_order,
         label_fn=lambda ex: ex[1],
     )
+
+
+def build_cifar100_cil_stream(
+    data_root: str,
+    n_experiences: int = 10,
+    seed: int = 0,
+    train_transform: Optional[transforms.Compose] = None,
+    test_transform: Optional[transforms.Compose] = None,
+) -> list[Experience]:
+    """
+    Build a class-incremental CIFAR-100 stream via the generic Class-IL builder.
+    Default: 10 experiences & 10 classes.
+    """
+    if train_transform is None:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+    if test_transform is None:
+        test_transform = transforms.Compose([transforms.ToTensor()])
+
+    train = datasets.CIFAR100(data_root, train=True,  download=True, transform=train_transform)
+    test  = datasets.CIFAR100(data_root, train=False, download=True, transform=test_transform)
+
+    class_order = list(range(100))
+    random.Random(seed).shuffle(class_order)
+
+    return build_class_incremental_stream(
+        train_ds=train,
+        test_ds=test,
+        num_classes=100,
+        n_experiences=n_experiences,
+        class_order=class_order,
+        label_fn=lambda ex: ex[1],
+    )
+
+
+def build_joint_stream_from_cil(stream: Sequence[Experience]) -> list[Experience]:
+    """
+    Build a single joint experience by concatenating all train/test splits from a Class-IL stream.
+    Useful as a 'joint training' upper bound baseline.
+    """
+    joint_train = ConcatDataset([exp.train_ds for exp in stream])
+    joint_test = ConcatDataset([exp.test_ds for exp in stream])
+    return [
+        Experience(
+            exp_id=0,
+            train_ds=joint_train,
+            test_ds=joint_test,
+            classes=sorted({c for exp in stream for c in exp.classes}),
+            meta={"type": "joint"},
+        )
+    ]
 
 
 def build_class_incremental_stream(
@@ -248,6 +302,37 @@ def build_domain_incremental_stream(
         experiences.append(exp)
 
     return experiences
+
+
+def build_cifar10_to_cifar100_domain_stream(
+    data_root: str,
+    seed: int = 0,
+    train_transform: Optional[transforms.Compose] = None,
+    test_transform: Optional[transforms.Compose] = None,
+) -> list[Experience]:
+    """
+    Simple domain-incremental stream: CIFAR-10 (all classes) to CIFAR-100 (all classes).
+    """
+    if train_transform is None:
+        train_transform = transforms.Compose([
+            transforms.RandomCrop(32, padding=4),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+    if test_transform is None:
+        test_transform = transforms.Compose([transforms.ToTensor()])
+
+    train10 = datasets.CIFAR10(data_root, train=True,  download=True, transform=train_transform)
+    test10  = datasets.CIFAR10(data_root, train=False, download=True, transform=test_transform)
+    train100 = datasets.CIFAR100(data_root, train=True,  download=True, transform=train_transform)
+    test100  = datasets.CIFAR100(data_root, train=False, download=True, transform=test_transform)
+
+    return build_domain_incremental_stream(
+        domain_train_datasets=[train10, train100],
+        domain_test_datasets=[test10, test100],
+        domain_names=["cifar10", "cifar100"],
+    )
+
 
 def build_custom_stream(
     train_datasets_list,
