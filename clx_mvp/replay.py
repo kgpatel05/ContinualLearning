@@ -118,3 +118,139 @@ class ERBuffer:
         self.seen = int(state["seen"])
         self._x = [t.clone() for t in state["x"]]
         self._y = [t.clone() for t in state["y"]]
+
+
+class RichERBuffer:
+    """
+    Extended buffer that tracks importance scores, class ids, and age.
+    Provides importance-aware add and class-balanced sampling.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self.capacity = int(capacity)
+        self._entries: List[Dict[str, Any]] = []
+        self._age_counter: int = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def add(
+        self,
+        x: Tensor,
+        y: Tensor,
+        scores: Optional[Tensor] = None,
+    ) -> None:
+        """
+        Add a batch with optional per-sample importance scores.
+        If buffer is full, replaces the lowest-score entries first.
+        """
+        assert x.size(0) == y.size(0), "x and y must have same batch size"
+        B = x.size(0)
+        if scores is None:
+            scores = torch.ones(B, device=x.device)
+        if scores.numel() != B:
+            raise ValueError("scores must match batch size")
+
+        for i in range(B):
+            self._admit_one(
+                x[i].detach().cpu(),
+                int(y[i].item()),
+                float(scores[i].detach().cpu().item()),
+            )
+
+    def _admit_one(self, x_one: Tensor, y_one: int, score: float) -> None:
+        entry = {
+            "x": x_one,
+            "y": torch.tensor(y_one, dtype=torch.long),
+            "score": float(score),
+            "class": int(y_one),
+            "age": self._age_counter,
+        }
+        self._age_counter += 1
+
+        if len(self._entries) < self.capacity:
+            self._entries.append(entry)
+            return
+
+        # importance-aware replacement: kick out lowest-score entry if incoming is higher
+        min_idx, min_entry = min(enumerate(self._entries), key=lambda kv: kv[1]["score"])
+        if score > min_entry["score"]:
+            self._entries[min_idx] = entry
+
+    def sample(
+        self,
+        k: int,
+        *,
+        class_balance: bool = True,
+        importance_sampling: bool = True,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        """
+        Sample up to k items, optionally class-balanced and/or importance-weighted.
+        """
+        n = len(self._entries)
+        if n == 0:
+            return None, None
+        k = min(k, n)
+
+        if class_balance:
+            idx = self._class_balanced_indices(k)
+        elif importance_sampling:
+            idx = self._importance_indices(k)
+        else:
+            idx = random.sample(range(n), k)
+
+        xs = torch.stack([self._entries[i]["x"] for i in idx], dim=0)
+        ys = torch.stack([self._entries[i]["y"] for i in idx], dim=0).long()
+        return xs, ys
+
+    def _class_balanced_indices(self, k: int) -> List[int]:
+        by_cls: Dict[int, List[int]] = {}
+        for idx, e in enumerate(self._entries):
+            by_cls.setdefault(e["class"], []).append(idx)
+
+        selected: List[int] = []
+        classes = list(by_cls.keys())
+        cls_ptr = 0
+        while len(selected) < k:
+            cls = classes[cls_ptr % len(classes)]
+            pool = by_cls[cls]
+            chosen = random.choice(pool)
+            selected.append(chosen)
+            cls_ptr += 1
+        return selected
+
+    def _importance_indices(self, k: int) -> List[int]:
+        scores = torch.tensor([e["score"] for e in self._entries], dtype=torch.float)
+        probs = scores / (scores.sum() + 1e-12)
+        chosen = torch.multinomial(probs, k, replacement=False).tolist()
+        return chosen
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "capacity": self.capacity,
+            "age": self._age_counter,
+            "entries": [
+                {
+                    "x": e["x"].clone(),
+                    "y": e["y"].clone(),
+                    "score": e["score"],
+                    "class": e["class"],
+                    "age": e["age"],
+                }
+                for e in self._entries
+            ],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.capacity = int(state["capacity"])
+        self._age_counter = int(state.get("age", 0))
+        self._entries = [
+            {
+                "x": ent["x"].clone(),
+                "y": ent["y"].clone(),
+                "score": float(ent["score"]),
+                "class": int(ent["class"]),
+                "age": int(ent.get("age", 0)),
+            }
+            for ent in state["entries"]
+        ]
