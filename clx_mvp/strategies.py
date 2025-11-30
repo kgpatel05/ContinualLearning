@@ -221,6 +221,9 @@ class LwFStrategy(CLStrategy):
 class AGEMStrategy(CLStrategy):
     """
     Averaged GEM (A-GEM) with gradient projection using episodic memory (ERBuffer).
+    
+    Uses fabric.backward() to compute gradients, then manually projects them
+    to avoid conflicts with reference gradients from memory.
     """
 
     def __init__(
@@ -230,6 +233,7 @@ class AGEMStrategy(CLStrategy):
     ):
         self.mem_batch_size = int(mem_batch_size)
         self.base = base_strategy
+        self._skip_backward = False  # Flag to signal custom gradient handling
 
     def before_experience(self, learner, exp) -> None:
         if self.base:
@@ -241,6 +245,7 @@ class AGEMStrategy(CLStrategy):
         else:
             learner._current_batch_for_buffer = (x.detach(), y.detach())
 
+        # Sample reference batch from memory
         mem_x, mem_y = learner.buffer.sample(self.mem_batch_size)
         if mem_x is not None:
             mem_x = mem_x.to(x.device, non_blocking=True)
@@ -248,42 +253,68 @@ class AGEMStrategy(CLStrategy):
             learner._agem_ref_batch = (mem_x, mem_y)
         else:
             learner._agem_ref_batch = None
+        
+        self._skip_backward = True  # Signal to Learner to skip normal backward
         return x, y
 
     def loss(self, learner, logits: Tensor, y: Tensor) -> Tensor:
-        params = [p for p in learner.model.parameters() if p.requires_grad]
-
+        """
+        Compute current loss (will be used for backward in apply_agem_gradients).
+        """
         if self.base:
-            base_loss = self.base.loss(learner, logits, y)
+            return self.base.loss(learner, logits, y)
         else:
-            base_loss = learner.criterion(logits, y)
+            return learner.criterion(logits, y)
 
-        g_cur = torch.autograd.grad(base_loss, params, retain_graph=True, allow_unused=True)
-        g_cur = [gc if gc is not None else torch.zeros_like(p) for gc, p in zip(g_cur, params)]
-
+    def apply_agem_gradients(self, learner, current_loss: Tensor) -> None:
+        """
+        Custom gradient computation and projection for AGEM.
+        
+        Steps:
+        1. Backward on current loss to get g_cur
+        2. Copy current gradients
+        3. Zero gradients and backward on reference loss to get g_ref
+        4. Project g_cur if it conflicts with g_ref (dot product < 0)
+        5. Set projected gradients back to parameters
+        """
+        params = [p for p in learner.model.parameters() if p.requires_grad]
+        
+        # Step 1: Compute current gradients
+        learner.optimizer.zero_grad(set_to_none=True)
+        learner.fabric.backward(current_loss)
+        
+        # Step 2: Copy current gradients
+        g_cur = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
+        
+        # Step 3: Compute reference gradients
         ref_batch = getattr(learner, "_agem_ref_batch", None)
         if ref_batch is not None:
             mem_x, mem_y = ref_batch
+            learner.optimizer.zero_grad(set_to_none=True)
+            
             ref_logits = learner.model(mem_x)
             ref_loss = learner.criterion(ref_logits, mem_y)
-            g_ref = torch.autograd.grad(ref_loss, params, retain_graph=False, allow_unused=True)
-            g_ref = [gr if gr is not None else torch.zeros_like(p) for gr, p in zip(g_ref, params)]
+            learner.fabric.backward(ref_loss)
+            
+            g_ref = [p.grad.clone() if p.grad is not None else torch.zeros_like(p) for p in params]
         else:
             g_ref = [torch.zeros_like(p) for p in params]
-
+        
+        # Step 4: Project if current gradients conflict with reference gradients
         dot = sum((gc * gr).sum() for gc, gr in zip(g_cur, g_ref))
-        ref_norm = sum((gr ** 2).sum() for gr in g_ref) + 1e-12
-
+        
         if ref_batch is not None and dot < 0:
+            # Negative dot product: project g_cur onto g_ref
+            ref_norm = sum((gr ** 2).sum() for gr in g_ref) + 1e-12
             proj_scale = dot / ref_norm
             g_new = [gc - proj_scale * gr for gc, gr in zip(g_cur, g_ref)]
         else:
+            # No conflict or no reference: use current gradients as-is
             g_new = g_cur
-
-        surrogate = 0.0
+        
+        # Step 5: Set projected gradients
         for p, g in zip(params, g_new):
-            surrogate = surrogate + (p * g.detach()).sum()
-        return surrogate
+            p.grad = g
 
     def after_experience(self, learner, exp) -> None:
         if self.base:

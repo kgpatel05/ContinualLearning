@@ -198,6 +198,7 @@ class Learner:
         Behavior:
             - Delegates per-batch augmentation/replay to strategy hooks.
             - Computes loss via strategy, backward, step.
+            - Special handling for AGEM: uses custom gradient projection.
             - Admits only the current batch samples into the buffer.
         """
         self.model.train()
@@ -210,9 +211,24 @@ class Learner:
 
                 logits = self.model(x)
                 loss = self.strategy.loss(self, logits, y)
-                self.optimizer.zero_grad(set_to_none=True)
-                self.fabric.backward(loss)
-                self.optimizer.step()
+                
+                # Check if strategy has custom gradient handling (e.g., AGEM)
+                if hasattr(self.strategy, '_skip_backward') and self.strategy._skip_backward:
+                    # AGEM uses custom backward/projection
+                    if hasattr(self.strategy, 'apply_agem_gradients'):
+                        self.strategy.apply_agem_gradients(self, loss)
+                        self.optimizer.step()
+                    else:
+                        # Fallback to normal backward if method missing
+                        self.optimizer.zero_grad(set_to_none=True)
+                        self.fabric.backward(loss)
+                        self.optimizer.step()
+                else:
+                    # Normal backward pass for other strategies
+                    self.optimizer.zero_grad(set_to_none=True)
+                    self.fabric.backward(loss)
+                    self.optimizer.step()
+                
                 num_updates += 1
 
                 cur_batch = getattr(self, "_current_batch_for_buffer", None)
