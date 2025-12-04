@@ -1,9 +1,10 @@
 # clx_mvp/metrics.py
 from __future__ import annotations
-from typing import List, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 import torch
 from torch.utils.data import DataLoader
 from lightning.fabric import Fabric
+from torch.utils.flop_counter import FlopCounterMode
 from .streams import Experience
 
 
@@ -121,3 +122,153 @@ def compute_forgetting(acc_matrix: List[List[float]]) -> List[float]:
         forgetting.append(max(0.0, max_acc - final_acc))
     
     return forgetting
+
+# ---- Efficiency-aware metrics ----
+
+def _tensor_nbytes(t: torch.Tensor) -> int:
+    return t.numel() * t.element_size()
+
+def count_trainable_params(model: torch.nn.Module) -> int:
+    """Number of parameters that require gradients."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def estimate_model_memory_bytes(
+    model: torch.nn.Module,
+    *,
+    include_buffers: bool = True,
+    include_gradients: bool = False,
+    trainable_only: bool = False,
+) -> int:
+    """
+    Estimate model memory footprint (parameters + optional buffers/gradients) in bytes.
+    """
+    total = 0
+    for p in model.parameters():
+        if trainable_only and not p.requires_grad:
+            continue
+        total += _tensor_nbytes(p)
+        if include_gradients and p.grad is not None:
+            total += _tensor_nbytes(p.grad)
+
+    if include_buffers:
+        for b in model.buffers():
+            total += _tensor_nbytes(b)
+
+    return total
+
+def estimate_buffer_memory_bytes(buffer: Any) -> int:
+    """
+    Estimate memory footprint of replay buffers (CPU tensors only).
+    Supports ERBuffer and RichERBuffer; falls back to 0 if unsupported.
+    """
+    total = 0
+
+    if hasattr(buffer, "_x") and hasattr(buffer, "_y"):
+        xs = getattr(buffer, "_x", [])
+        ys = getattr(buffer, "_y", [])
+        total += sum(_tensor_nbytes(t) for t in xs if isinstance(t, torch.Tensor))
+        total += sum(_tensor_nbytes(t) for t in ys if isinstance(t, torch.Tensor))
+        return total
+
+    if hasattr(buffer, "_entries"):
+        entries = getattr(buffer, "_entries", [])
+        for ent in entries:
+            x = ent.get("x")
+            y = ent.get("y")
+            if isinstance(x, torch.Tensor):
+                total += _tensor_nbytes(x)
+            if isinstance(y, torch.Tensor):
+                total += _tensor_nbytes(y)
+        return total
+
+    return 0
+
+def estimate_flops(
+    model: torch.nn.Module,
+    input_shape: Sequence[int],
+    *,
+    include_backward: bool = True,
+    device: Optional[torch.device] = None,
+) -> Optional[int]:
+    """
+    Estimate FLOPs for a single training update using Torch's flop counter.
+
+    Args:
+        model: nn.Module to profile.
+        input_shape: shape tuple for a single batch (e.g., (1, 3, 32, 32)).
+        include_backward: if True, doubles forward FLOPs to approximate backward pass.
+        device: optional device for the dummy input; defaults to model parameters' device.
+
+    Returns:
+        int FLOPs for forward (or forward+backward) pass, or None if estimation fails.
+    """
+    was_training = model.training
+    dev = device
+    if dev is None:
+        try:
+            dev = next(model.parameters()).device
+        except StopIteration:
+            dev = torch.device("cpu")
+
+    try:
+        dummy = torch.zeros(tuple(input_shape), device=dev)
+        model.eval()
+        with torch.no_grad(), FlopCounterMode(display=False) as counter:
+            _ = model(dummy)
+        fwd_flops = int(counter.get_total_flops())
+        total_flops = fwd_flops * 2 if include_backward else fwd_flops
+        return total_flops
+    except Exception:
+        return None
+    finally:
+        model.train(was_training)
+
+def summarize_efficiency(
+    stats_log: Sequence[Dict[str, Any]],
+    *,
+    model: Optional[torch.nn.Module] = None,
+    buffer: Any = None,
+    input_shape: Optional[Sequence[int]] = None,
+    include_backward_in_flops: bool = True,
+) -> Dict[str, Any]:
+    """
+    Summarize efficiency metrics (time, updates, memory, FLOPs).
+
+    Args:
+        stats_log: sequence of per-experience stats dicts emitted by Learner._train_one_experience().
+        model: optional model to compute parameter counts/memory/FLOPs.
+        buffer: optional replay buffer to measure memory footprint.
+        input_shape: shape used to estimate per-forward FLOPs (e.g., (1, 3, 32, 32)).
+        include_backward_in_flops: if True, FLOPs include an approximate backward pass.
+
+    Returns:
+        Dict with totals and estimates; missing estimates use None.
+    """
+    total_updates = sum(int(s.get("num_updates", 0)) for s in stats_log)
+    total_time = sum(float(s.get("train_time_sec", 0.0)) for s in stats_log)
+    max_buffer_size = max((int(s.get("buffer_size", 0)) for s in stats_log), default=0)
+
+    updates_per_sec = total_updates / total_time if total_time > 0 else 0.0
+    time_per_update = total_time / total_updates if total_updates > 0 else 0.0
+
+    summary: Dict[str, Any] = {
+        "total_updates": total_updates,
+        "total_train_time_sec": total_time,
+        "updates_per_sec": updates_per_sec,
+        "time_per_update_sec": time_per_update,
+        "max_buffer_size": max_buffer_size,
+    }
+
+    if model is not None:
+        summary["trainable_params"] = count_trainable_params(model)
+        summary["model_memory_bytes"] = estimate_model_memory_bytes(model)
+
+    if buffer is not None:
+        summary["buffer_memory_bytes"] = estimate_buffer_memory_bytes(buffer)
+
+    if model is not None and input_shape is not None:
+        flops = estimate_flops(model, input_shape, include_backward=include_backward_in_flops)
+        summary["flops_per_update"] = flops
+        summary["total_flops"] = flops * total_updates if flops is not None else None
+
+    return summary
