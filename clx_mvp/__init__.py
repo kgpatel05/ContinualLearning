@@ -35,10 +35,15 @@ from .strategies import (
     LwFStrategy,
     AGEMStrategy,
     BASRStrategy,
+    SiestaConfig,
+    SleepScheduleConfig,
+    SiestaStrategy,
+    GraspConfig,
+    GraspRehearsalPolicy,
+    GraspStrategy,
+    SgmConfig,
+    SgmStrategy,
 )
-from .siesta import SiestaConfig, SleepScheduleConfig, SiestaStrategy
-from .grasp import GraspConfig, GraspRehearsalPolicy, GraspStrategy
-from .sgm import SgmConfig, SgmStrategy
 
 __all__ = [
     "Experience",

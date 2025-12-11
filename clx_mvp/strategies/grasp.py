@@ -8,10 +8,10 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .strategies import CLStrategy
-from .replay import RichERBuffer
-from .features import FeatureExtractor, FeatureExtractorConfig
-from .configs import LinearScheduleConfig, linear_schedule
+from .base import CLStrategy
+from ..replay import RichERBuffer
+from ..features import FeatureExtractor, FeatureExtractorConfig
+from ..configs import LinearScheduleConfig, linear_schedule
 
 
 @dataclass

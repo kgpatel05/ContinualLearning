@@ -8,11 +8,11 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .strategies import CLStrategy
-from .replay import LatentReplayBuffer
-from .compression import LatentCompressionConfig, build_compressor, LatentCompressor
-from .features import FeatureExtractor, FeatureExtractorConfig
-from .configs import OptimizerConfig
+from .base import CLStrategy
+from ..replay import LatentReplayBuffer
+from ..compression import LatentCompressionConfig, build_compressor, LatentCompressor
+from ..features import FeatureExtractor, FeatureExtractorConfig
+from ..configs import OptimizerConfig
 
 
 @dataclass

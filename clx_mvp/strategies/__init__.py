@@ -6,6 +6,9 @@ from .ewc import EWCStrategy
 from .lwf import LwFStrategy
 from .agem import AGEMStrategy
 from .basr import BASRStrategy
+from .siesta import SiestaConfig, SleepScheduleConfig, SiestaStrategy
+from .grasp import GraspConfig, GraspRehearsalPolicy, GraspStrategy
+from .sgm import SgmConfig, SgmStrategy
 
 __all__ = [
     "CLStrategy",
@@ -15,4 +18,12 @@ __all__ = [
     "LwFStrategy",
     "AGEMStrategy",
     "BASRStrategy",
+    "SiestaConfig",
+    "SleepScheduleConfig",
+    "SiestaStrategy",
+    "GraspConfig",
+    "GraspRehearsalPolicy",
+    "GraspStrategy",
+    "SgmConfig",
+    "SgmStrategy",
 ]

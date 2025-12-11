@@ -9,9 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from .strategies import CLStrategy
-from .features import FeatureExtractor, FeatureExtractorConfig
-from .lora import LoraConfig, inject_lora_layers
+from .base import CLStrategy
+from ..features import FeatureExtractor, FeatureExtractorConfig
+from ..lora import LoraConfig, inject_lora_layers
 
 
 @dataclass
