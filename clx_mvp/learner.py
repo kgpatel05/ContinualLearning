@@ -211,9 +211,12 @@ class Learner:
 
                 logits = self.model(x)
                 loss = self.strategy.loss(self, logits, y)
-                
-                # Check if strategy has custom gradient handling (e.g., AGEM)
-                if hasattr(self.strategy, '_skip_backward') and self.strategy._skip_backward:
+                handled = False
+                if getattr(self.strategy, "handles_optimization", False) and hasattr(self.strategy, "optimize_batch"):
+                    # Strategy owns backward/step (e.g., SIESTA sleep/wake control)
+                    self.strategy.optimize_batch(self, loss, logits, y)  # type: ignore[arg-type]
+                    handled = True
+                elif hasattr(self.strategy, '_skip_backward') and self.strategy._skip_backward:
                     # AGEM uses custom backward/projection
                     if hasattr(self.strategy, 'apply_agem_gradients'):
                         self.strategy.apply_agem_gradients(self, loss)
@@ -223,7 +226,9 @@ class Learner:
                         self.optimizer.zero_grad(set_to_none=True)
                         self.fabric.backward(loss)
                         self.optimizer.step()
-                else:
+                    handled = True
+
+                if not handled:
                     # Normal backward pass for other strategies
                     self.optimizer.zero_grad(set_to_none=True)
                     self.fabric.backward(loss)
@@ -231,21 +236,37 @@ class Learner:
                 
                 num_updates += 1
 
-                cur_batch = getattr(self, "_current_batch_for_buffer", None)
-                if cur_batch is None:
-                    cur_batch = (x.detach(), y.detach())
+                skip_buffer_add = getattr(self, "_skip_buffer_addition", False)
+                if not skip_buffer_add:
+                    cur_batch = getattr(self, "_current_batch_for_buffer", None)
+                    if cur_batch is None:
+                        cur_batch = (x.detach(), y.detach())
 
-                if isinstance(cur_batch, tuple) and len(cur_batch) == 3:
-                    cur_x, cur_y, scores = cur_batch
-                    try:
-                        self.buffer.add(cur_x, cur_y, scores=scores)
-                    except TypeError:
+                    if isinstance(cur_batch, tuple) and len(cur_batch) == 4:
+                        cur_x, cur_y, scores, feats = cur_batch
+                        try:
+                            self.buffer.add(cur_x, cur_y, scores=scores, features=feats)
+                        except TypeError:
+                            self.buffer.add(cur_x, cur_y)
+                    elif isinstance(cur_batch, tuple) and len(cur_batch) == 3:
+                        cur_x, cur_y, scores = cur_batch
+                        try:
+                            self.buffer.add(cur_x, cur_y, scores=scores)
+                        except TypeError:
+                            self.buffer.add(cur_x, cur_y)
+                    else:
+                        cur_x, cur_y = cur_batch
                         self.buffer.add(cur_x, cur_y)
-                else:
-                    cur_x, cur_y = cur_batch
-                    self.buffer.add(cur_x, cur_y)
 
                 self._current_batch_for_buffer = None
+                self._skip_buffer_addition = False
+
+                if hasattr(self.strategy, "after_batch"):
+                    try:
+                        self.strategy.after_batch(self, x, y, loss)
+                    except TypeError:
+                        # keep backward compatibility if signature omits loss
+                        self.strategy.after_batch(self, x, y)
 
         t1 = time.perf_counter()
         stats = {

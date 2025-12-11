@@ -139,6 +139,7 @@ class RichERBuffer:
         x: Tensor,
         y: Tensor,
         scores: Optional[Tensor] = None,
+        features: Optional[Tensor] = None,
     ) -> None:
         """
         Add a batch with optional per-sample importance scores.
@@ -156,15 +157,17 @@ class RichERBuffer:
                 x[i].detach().cpu(),
                 int(y[i].item()),
                 float(scores[i].detach().cpu().item()),
+                feat=features[i].detach().cpu() if features is not None else None,
             )
 
-    def _admit_one(self, x_one: Tensor, y_one: int, score: float) -> None:
+    def _admit_one(self, x_one: Tensor, y_one: int, score: float, feat: Optional[Tensor] = None) -> None:
         entry = {
             "x": x_one,
             "y": torch.tensor(y_one, dtype=torch.long),
             "score": float(score),
             "class": int(y_one),
             "age": self._age_counter,
+            "feat": feat,
         }
         self._age_counter += 1
 
@@ -183,7 +186,8 @@ class RichERBuffer:
         *,
         class_balance: bool = True,
         importance_sampling: bool = True,
-    ) -> Tuple[Optional[Tensor], Optional[Tensor]]:
+        return_features: bool = False,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor]] | Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
         """
         Sample up to k items, optionally class-balanced and/or importance-weighted.
         """
@@ -201,6 +205,13 @@ class RichERBuffer:
 
         xs = torch.stack([self._entries[i]["x"] for i in idx], dim=0)
         ys = torch.stack([self._entries[i]["y"] for i in idx], dim=0).long()
+        if return_features:
+            feats = [self._entries[i].get("feat") for i in idx]
+            if all(f is not None for f in feats):
+                feat_tensor = torch.stack([f for f in feats], dim=0)  # type: ignore[arg-type]
+            else:
+                feat_tensor = None
+            return xs, ys, feat_tensor
         return xs, ys
 
     def _class_balanced_indices(self, k: int) -> List[int]:
@@ -236,6 +247,7 @@ class RichERBuffer:
                     "score": e["score"],
                     "class": e["class"],
                     "age": e["age"],
+                    "feat": e.get("feat"),
                 }
                 for e in self._entries
             ],
@@ -251,6 +263,155 @@ class RichERBuffer:
                 "score": float(ent["score"]),
                 "class": int(ent["class"]),
                 "age": int(ent.get("age", 0)),
+                "feat": ent.get("feat"),
             }
             for ent in state["entries"]
+        ]
+
+
+class LatentReplayBuffer:
+    """
+    Reservoir-sampled buffer for compressed latent representations.
+    Stores encoded latents plus optional auxiliary data (e.g., scales) and metadata.
+    """
+    def __init__(self, capacity: int, replacement: str = "reservoir") -> None:
+        self.capacity = int(capacity)
+        self.replacement = replacement
+        self._entries: List[Dict[str, Any]] = []
+        self.seen: int = 0
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def add(
+        self,
+        encoded_latents: Tensor,
+        labels: Tensor,
+        *,
+        aux: Optional[Tensor] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """
+        Add a batch of encoded latents.
+
+        Args:
+            encoded_latents: compressed latents (typically CPU).
+            labels: class labels.
+            aux: optional per-sample aux data (e.g., quantization scales) aligned with batch.
+            metadata: optional metadata dict attached to every sample in the batch.
+        """
+        assert encoded_latents.size(0) == labels.size(0), "latent/label batch mismatch"
+        B = encoded_latents.size(0)
+        aux_tensor = None
+        if aux is not None:
+            if aux.dim() == 0 or aux.size(0) != B:
+                aux_tensor = aux.detach().cpu().expand(B, *([1] * (encoded_latents.dim() - 1)))
+            else:
+                aux_tensor = aux.detach().cpu()
+
+        for i in range(B):
+            entry_meta = {} if metadata is None else dict(metadata)
+            self._admit_one(
+                encoded_latents[i].detach().cpu(),
+                int(labels[i].item()),
+                aux_tensor[i].detach().cpu() if aux_tensor is not None else None,
+                entry_meta,
+            )
+            self.seen += 1
+
+    def _admit_one(
+        self,
+        latent_one: Tensor,
+        label_one: int,
+        aux_one: Optional[Tensor],
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        entry = {
+            "latent": latent_one,
+            "label": torch.tensor(label_one, dtype=torch.long),
+            "aux": aux_one,
+            "meta": metadata or {},
+        }
+
+        if len(self._entries) < self.capacity:
+            self._entries.append(entry)
+            return
+
+        if self.replacement == "fifo":
+            self._entries.pop(0)
+            self._entries.append(entry)
+            return
+
+        # default: reservoir
+        j = random.randint(0, self.seen)
+        if j < self.capacity:
+            self._entries[j] = entry
+
+    def sample(
+        self,
+        k: int,
+        *,
+        return_metadata: bool = False,
+    ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor]] | Tuple[Optional[Tensor], Optional[Tensor], Optional[Tensor], Optional[List[Dict[str, Any]]]]:
+        """
+        Sample compressed latents.
+
+        Returns:
+            encoded_latents, labels, aux [, metadata]
+        """
+        n = len(self._entries)
+        if n == 0:
+            if return_metadata:
+                return None, None, None, None
+            return None, None, None
+        k = min(k, n)
+        idx = random.sample(range(n), k)
+        latents = torch.stack([self._entries[i]["latent"] for i in idx], dim=0)
+        labels = torch.stack([self._entries[i]["label"] for i in idx], dim=0).long()
+        aux = None
+        aux_values = [self._entries[i]["aux"] for i in idx]
+        if any(a is not None for a in aux_values):
+            template = next((a for a in aux_values if a is not None), None)
+            if template is None:
+                template = torch.zeros_like(latents)
+            aux = torch.stack(
+                [
+                    a if a is not None else torch.zeros_like(template)  # type: ignore[arg-type]
+                    for a in aux_values
+                ],
+                dim=0,
+            )
+        if return_metadata:
+            metas = [self._entries[i].get("meta", {}) for i in idx]
+            return latents, labels, aux, metas
+        return latents, labels, aux
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "capacity": self.capacity,
+            "replacement": self.replacement,
+            "seen": self.seen,
+            "entries": [
+                {
+                    "latent": e["latent"].clone(),
+                    "label": e["label"].clone(),
+                    "aux": None if e["aux"] is None else e["aux"].clone(),
+                    "meta": dict(e.get("meta", {})),
+                }
+                for e in self._entries
+            ],
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        self.capacity = int(state["capacity"])
+        self.replacement = state.get("replacement", "reservoir")
+        self.seen = int(state.get("seen", 0))
+        self._entries = [
+            {
+                "latent": ent["latent"].clone(),
+                "label": ent["label"].clone(),
+                "aux": None if ent.get("aux") is None else ent["aux"].clone(),
+                "meta": dict(ent.get("meta", {})),
+            }
+            for ent in state.get("entries", [])
         ]
