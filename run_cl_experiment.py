@@ -1,7 +1,5 @@
 # experiments/run_cl_experiment.py
-# python experiments/run_cl_experiment.py --algo er --dataset cifar100 --n-experiences 10
-# python experiments/run_cl_experiment.py --algo finetune --dataset cifar10 --n-experiences 5
-# python experiments/run_cl_experiment.py --algo ewc --dataset cifar10 --n-experiences 5
+# python experiments/run_cl_experiment.py --algo er --dataset cifar10 --n-experiences 5
 
 """
 Run continual learning experiments with multiple algorithms on Split CIFAR.
@@ -36,43 +34,43 @@ from clx_mvp import (
 
 from clx_mvp.metrics import classification_metrics
 
+
+# ---------------------------------------------------------------------
+# ARGUMENTS
+# ---------------------------------------------------------------------
+
 def parse_args():
-    p = argparse.ArgumentParser(description="CL experiment with accuracy matrix + efficiency stats")
-    # Algorithm selection
-    p.add_argument(
-        "--algo",
-        choices=["er", "finetune", "ewc", "lwf", "agem", "basr"],
-        default="er",
-        help="Continual learning algorithm to use"
-    )
-    
-    # Dataset configuration
+    p = argparse.ArgumentParser(description="CL experiment with metrics + efficiency stats")
+
+    p.add_argument("--algo", choices=["er", "finetune", "ewc", "lwf", "agem", "basr"], default="er")
     p.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10")
     p.add_argument("--data-root", default="./data")
-    p.add_argument("--n-experiences", type=int, default=None, help="If unset: 5 for CIFAR-10, 10 for CIFAR-100")
+    p.add_argument("--n-experiences", type=int, default=None)
     p.add_argument("--seed", type=int, default=0)
-    
-    # Buffer configuration
+
     p.add_argument("--buffer-capacity", type=int, default=2000)
-    p.add_argument("--replay-ratio", type=float, default=0.5, help="For replay-based methods")
-    
-    # Training configuration
+    p.add_argument("--replay-ratio", type=float, default=0.5)
+
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--num-workers", type=int, default=2)
     p.add_argument("--precision", default="bf16-mixed")
+
     p.add_argument("--lr", type=float, default=0.03)
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--momentum", type=float, default=0.9)
-    
-    # Algorithm-specific hyperparameters
-    p.add_argument("--ewc-lambda", type=float, default=1000.0, help="EWC regularization strength")
-    p.add_argument("--lwf-alpha", type=float, default=1.0, help="LwF distillation weight")
-    p.add_argument("--lwf-temperature", type=float, default=2.0, help="LwF distillation temperature")
-    p.add_argument("--agem-mem-size", type=int, default=256, help="AGEM reference batch size")
-    
+
+    p.add_argument("--ewc-lambda", type=float, default=1000.0)
+    p.add_argument("--lwf-alpha", type=float, default=1.0)
+    p.add_argument("--lwf-temperature", type=float, default=2.0)
+    p.add_argument("--agem-mem-size", type=int, default=256)
+
     return p.parse_args()
 
+
+# ---------------------------------------------------------------------
+# BUILDERS
+# ---------------------------------------------------------------------
 
 def build_stream(args):
     if args.dataset == "cifar10":
@@ -87,51 +85,44 @@ def build_stream(args):
 
 
 def build_strategy(args):
-    """Build the CL strategy based on algorithm selection."""
     if args.algo == "finetune":
         return FinetuneStrategy()
-    
-    elif args.algo == "er":
+
+    if args.algo == "er":
         return ERStrategy(replay_ratio=args.replay_ratio)
-    
-    elif args.algo == "ewc":
-        # EWC can optionally wrap ER for rehearsal + regularization
+
+    if args.algo == "ewc":
         base = ERStrategy(replay_ratio=args.replay_ratio) if args.replay_ratio > 0 else None
         return EWCStrategy(lambda_=args.ewc_lambda, base_strategy=base)
-    
-    elif args.algo == "lwf":
-        # LwF can optionally wrap ER
+
+    if args.algo == "lwf":
         base = ERStrategy(replay_ratio=args.replay_ratio) if args.replay_ratio > 0 else None
         return LwFStrategy(alpha=args.lwf_alpha, temperature=args.lwf_temperature, base_strategy=base)
-    
-    elif args.algo == "agem":
+
+    if args.algo == "agem":
         return AGEMStrategy(mem_batch_size=args.agem_mem_size)
-    
-    elif args.algo == "basr":
+
+    if args.algo == "basr":
         return BASRStrategy(
             replay_ratio=args.replay_ratio,
             class_balance=True,
-            importance_sampling=True
+            importance_sampling=True,
         )
-    
-    else:
-        raise ValueError(f"Unknown algorithm: {args.algo}")
+
+    raise ValueError(args.algo)
 
 
 def build_buffer(args):
-    """Build the appropriate buffer for the selected algorithm."""
     if args.algo == "finetune":
-        # Finetune doesn't use buffer, but Learner requires one
         return ERBuffer(capacity=100)
-    
-    elif args.algo == "basr":
-        # BASR requires RichERBuffer for importance tracking
+    if args.algo == "basr":
         return RichERBuffer(capacity=args.buffer_capacity)
-    
-    else:
-        # All other methods use standard ERBuffer
-        return ERBuffer(capacity=args.buffer_capacity)
+    return ERBuffer(capacity=args.buffer_capacity)
 
+
+# ---------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------
 
 def main():
     args = parse_args()
@@ -142,15 +133,9 @@ def main():
 
     stream, num_classes = build_stream(args)
     model = build_resnet18(num_classes=num_classes, pretrained=False)
+
     buffer = build_buffer(args)
     strategy = build_strategy(args)
-
-    fabric.print(f"\n{'='*60}")
-    fabric.print(f"Algorithm: {args.algo.upper()}")
-    fabric.print(f"Dataset: {args.dataset.upper()} ({len(stream)} experiences)")
-    fabric.print(f"Buffer capacity: {args.buffer_capacity}")
-    fabric.print(f"Replay ratio: {args.replay_ratio}")
-    fabric.print(f"{'='*60}\n")
 
     learner = Learner(
         model=model,
@@ -167,88 +152,116 @@ def main():
         pin_memory=True,
     )
 
-    evaluator = ContinualEvaluator(stream, fabric, batch_size=args.batch_size, num_workers=args.num_workers)
+    evaluator = ContinualEvaluator(
+        stream,
+        fabric,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
 
     per_exp_acc = []
     stats_log = []
     metrics_log = []
 
+    # -----------------------------------------------------------------
+    # TRAIN LOOP
+    # -----------------------------------------------------------------
+
     for k, exp in enumerate(stream):
         learner.strategy.before_experience(learner, exp)
+
         tr_loader, te_loader = learner._make_loaders(exp)
         stats = learner._train_one_experience(tr_loader, exp_id=exp.exp_id)
+
         learner.strategy.after_experience(learner, exp)
 
         acc = accuracy(learner.model, te_loader, fabric)
         per_exp_acc.append(acc)
-        acc_row = evaluator.evaluate_after_exp(learner.model, upto_exp=k)
-        stats_log.append(stats)
 
-        # --- Compute classification metrics ---
-        metrics = classification_metrics(learner.model, te_loader, fabric, num_classes=num_classes)
+        evaluator.evaluate_after_exp(learner.model, upto_exp=k)
+
+        metrics = classification_metrics(
+            learner.model,
+            te_loader,
+            fabric,
+            num_classes=num_classes,
+        )
+
         precision = metrics.get("precision", 0.0)
         recall = metrics.get("recall", 0.0)
         f1 = 2 * (precision * recall) / (precision + recall + 1e-8)
+
         metrics_log.append({
-            "experience": exp.exp_id,
-            "classes": exp.classes,
+            "exp_id": exp.exp_id,
             "accuracy": metrics.get("accuracy", acc),
             "precision": precision,
             "recall": recall,
-            "f1": f1
+            "f1": f1,
         })
 
+        stats_log.append(stats)
+
         fabric.print(
-            f"[Exp {exp.exp_id}] classes={exp.classes} acc={acc:.2f}% "
+            f"[Exp {exp.exp_id}] "
+            f"acc={acc:.2f}% "
             f"AA={average_accuracy(per_exp_acc):.2f}% "
-            f"updates={stats['num_updates']} time={stats['train_time_sec']:.1f}s "
+            f"updates={stats['num_updates']} "
+            f"time={stats['train_time_sec']:.1f}s "
             f"buffer={stats['buffer_size']}"
         )
 
+    # -----------------------------------------------------------------
+    # FINAL STATS
+    # -----------------------------------------------------------------
+
     forgetting = compute_forgetting(evaluator.acc_matrix)
     avg_forgetting = sum(forgetting) / len(forgetting) if forgetting else 0.0
-    total_time = sum(s['train_time_sec'] for s in stats_log)
-    total_updates = sum(s['num_updates'] for s in stats_log)
 
-    fabric.print(f"\n{'='*60}")
-    fabric.print("FINAL RESULTS")
-    fabric.print(f"{'='*60}")
+    fabric.print("\nFINAL RESULTS")
     fabric.print(f"Average accuracy: {average_accuracy(per_exp_acc):.2f}%")
     fabric.print(f"Average forgetting: {avg_forgetting:.2f}%")
-    fabric.print(f"Total training time: {total_time:.1f}s")
-    fabric.print(f"Total updates: {total_updates}")
-    fabric.print(f"\nPer-task forgetting: {[f'{f:.2f}' for f in forgetting]}")
+
+    # -----------------------------------------------------------------
+    # SAVE CSV (CORRECT)
+    # -----------------------------------------------------------------
 
     if fabric.global_rank == 0:
-        fabric.print(f"\nAccuracy matrix:")
-        for i, row in enumerate(evaluator.acc_matrix):
-            fabric.print(f"  After exp {i}: {[f'{a:.2f}' for a in row]}")
+        csv_name = f"metrics_seed{args.seed}.csv"
 
-# Save metrics to CSV with seed in filename
-    metrics_filename = f"metrics_seed{args.seed}.csv"
-    metrics_filepath = os.path.join("./", metrics_filename)
+        with open(csv_name, "w", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "exp_id",
+                    "accuracy",
+                    "average_accuracy",
+                    "precision",
+                    "recall",
+                    "f1",
+                    "num_updates",
+                    "train_time_sec",
+                    "buffer_size",
+                ],
+            )
+            writer.writeheader()
 
-    # Gather metrics per experience
-    with open(metrics_filepath, mode="w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["exp_id", "accuracy", "average_accuracy",
-                                            "precision", "recall", "f1", "num_updates",
-                                            "train_time_sec", "buffer_size"])
-        writer.writeheader()
-        for k, exp in enumerate(stream):
-            metrics = classification_metrics(learner.model, te_loader, fabric, num_classes=num_classes)
-            writer.writerow({
-                "exp_id": exp.exp_id,
-                "accuracy": metrics["accuracy"],
-                "average_accuracy": average_accuracy(per_exp_acc),
-                "precision": metrics.get("precision", 0.0),
-                "recall": metrics.get("recall", 0.0),
-                "f1": metrics.get("f1", 0.0),
-                "num_updates": stats_log[k]["num_updates"],
-                "train_time_sec": stats_log[k]["train_time_sec"],
-                "buffer_size": stats_log[k]["buffer_size"]
-            })
+            running_acc = []
+            for i in range(len(metrics_log)):
+                running_acc.append(metrics_log[i]["accuracy"])
 
-    fabric.print(f"\nMetrics saved to {metrics_filename}")
+                writer.writerow({
+                    "exp_id": metrics_log[i]["exp_id"],
+                    "accuracy": metrics_log[i]["accuracy"],
+                    "average_accuracy": sum(running_acc) / len(running_acc),
+                    "precision": metrics_log[i]["precision"],
+                    "recall": metrics_log[i]["recall"],
+                    "f1": metrics_log[i]["f1"],
+                    "num_updates": stats_log[i]["num_updates"],
+                    "train_time_sec": stats_log[i]["train_time_sec"],
+                    "buffer_size": stats_log[i]["buffer_size"],
+                })
+
+        fabric.print(f"\nMetrics saved to {csv_name}")
 
 
 if __name__ == "__main__":
