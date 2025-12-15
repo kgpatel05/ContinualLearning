@@ -1,11 +1,12 @@
 # clx_mvp/metrics.py
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from lightning.fabric import Fabric
 from torch.utils.flop_counter import FlopCounterMode
 from .streams import Experience
+import numpy as np
 
 
 class ContinualEvaluator:
@@ -44,28 +45,220 @@ class ContinualEvaluator:
         self.acc_matrix.append(row)
         return row
 
+def _unpack_xy(batch: Union[Tuple, List, Dict[str, Any]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Best-effort extraction of (x, y) from common batch formats."""
+    if isinstance(batch, dict):
+        x = batch.get("x", batch.get("image"))
+        y = batch.get("y", batch.get("label"))
+        if x is None or y is None:
+            raise ValueError("Could not find x/y keys in batch dict")
+        return x, y
+    if isinstance(batch, (list, tuple)):
+        if len(batch) < 2:
+            raise ValueError("Batch tuple/list must have at least 2 elements")
+        return batch[0], batch[1]
+    raise TypeError(f"Unsupported batch type: {type(batch)}")
+
+
+def _to_device(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    fabric: Optional[Fabric] = None,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if fabric is not None:
+        x, y = fabric.to_device((x, y))
+    elif device is not None:
+        x = x.to(device)
+        y = y.to(device)
+    return x, y
+
+
 @torch.no_grad()
-def accuracy(model, loader: DataLoader, fabric: Fabric) -> float:
+def accuracy(
+    model,
+    loader: DataLoader,
+    fabric: Optional[Fabric] = None,
+    device: Optional[torch.device] = None,
+) -> float:
     """
     Compute top-1 accuracy (%).
 
     Inputs:
         model: nn.Module in eval() or train(); will be used under torch.no_grad
-        loader: DataLoader yielding (x, y)
-        fabric: Lightning Fabric instance (used for device placement)
+        loader: DataLoader yielding batches
+        fabric: optional Lightning Fabric instance for device placement
+        device: optional torch.device if not using Fabric
 
     Returns:
         float: accuracy in [0, 100].
     """
     model.eval()
     correct, total = 0, 0
-    for x, y in loader:
-        x, y = fabric.to_device((x, y))
+    for batch in loader:
+        x, y = _unpack_xy(batch)
+        x, y = _to_device(x, y, fabric=fabric, device=device)
         logits = model(x)
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.numel()
     return 100.0 * correct / max(1, total)
+
+
+@torch.no_grad()
+def classwise_accuracy_and_confusion(
+    model,
+    datasets: Sequence,
+    *,
+    num_classes: int,
+    fabric: Optional[Fabric] = None,
+    device: Optional[torch.device] = None,
+    batch_size: int = 128,
+    num_workers: int = 2,
+) -> Tuple[List[Optional[float]], List[List[int]]]:
+    """
+    Compute per-class accuracy and confusion matrix over concatenated datasets.
+
+    Args:
+        model: torch.nn.Module to evaluate.
+        datasets: sequence of datasets to concatenate (e.g., test splits of seen experiences).
+        num_classes: total number of classes in label space.
+        fabric: optional Fabric handle for device placement.
+        device: optional torch.device for non-Fabric runs.
+        batch_size: evaluation batch size.
+        num_workers: dataloader workers.
+
+    Returns:
+        (per_class_acc, confusion) where:
+            per_class_acc: list length num_classes with float accuracy (%) or None if unseen.
+            confusion: num_classes x num_classes confusion matrix (int counts).
+    """
+    if len(datasets) == 0:
+        return [], []
+
+    concat = datasets[0] if len(datasets) == 1 else ConcatDataset(list(datasets))
+    loader = DataLoader(concat, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    if fabric is not None:
+        loader = fabric.setup_dataloaders(loader)
+
+    model.eval()
+    confusion = torch.zeros((num_classes, num_classes), dtype=torch.long)
+    correct = torch.zeros(num_classes, dtype=torch.long)
+    counts = torch.zeros(num_classes, dtype=torch.long)
+
+    for batch in loader:
+        x, y = _unpack_xy(batch)
+        x, y = _to_device(x, y, fabric=fabric, device=device)
+        logits = model(x)
+        preds = logits.argmax(dim=1)
+
+        y_cpu = y.detach().long().cpu()
+        preds_cpu = preds.detach().long().cpu()
+
+        counts += torch.bincount(y_cpu, minlength=num_classes)
+        match = y_cpu == preds_cpu
+        correct += torch.bincount(y_cpu[match], minlength=num_classes)
+
+        for t, p in zip(y_cpu.tolist(), preds_cpu.tolist()):
+            if 0 <= t < num_classes and 0 <= p < num_classes:
+                confusion[t, p] += 1
+
+    per_class_acc: List[Optional[float]] = []
+    for idx in range(num_classes):
+        if counts[idx] == 0:
+            per_class_acc.append(None)
+        else:
+            per_class_acc.append(float(correct[idx].item()) * 100.0 / float(counts[idx].item()))
+
+    return per_class_acc, confusion.tolist()
+
+
+def classwise_accuracy_over_stream(
+    model,
+    stream: Sequence[Experience],
+    upto_exp: int,
+    *,
+    num_classes: int,
+    fabric: Optional[Fabric] = None,
+    device: Optional[torch.device] = None,
+    batch_size: int = 128,
+    num_workers: int = 2,
+) -> Tuple[List[Optional[float]], List[List[int]]]:
+    """
+    Convenience wrapper to evaluate classwise metrics on test sets of experiences
+    up to (and including) `upto_exp`.
+    """
+    datasets = [exp.test_ds for exp in stream[: upto_exp + 1]]
+    return classwise_accuracy_and_confusion(
+        model,
+        datasets,
+        num_classes=num_classes,
+        fabric=fabric,
+        device=device,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
+
+
+def classification_report_from_confusion(
+    confusion: Sequence[Sequence[int]],
+) -> Dict[str, float]:
+    """
+    Compute micro/macro precision, recall, and F1 from a confusion matrix.
+
+    Args:
+        confusion: square matrix where rows=true, cols=pred.
+    Returns:
+        Dict with keys:
+            precision_macro, recall_macro, f1_macro,
+            precision_micro, recall_micro, f1_micro.
+    """
+    if len(confusion) == 0:
+        return {
+            "precision_macro": 0.0,
+            "recall_macro": 0.0,
+            "f1_macro": 0.0,
+            "precision_micro": 0.0,
+            "recall_micro": 0.0,
+            "f1_micro": 0.0,
+        }
+
+    conf = np.array(confusion, dtype=float)
+    tp = np.diag(conf)
+    fp = conf.sum(axis=0) - tp
+    fn = conf.sum(axis=1) - tp
+    with np.errstate(divide="ignore", invalid="ignore"):
+        prec = tp / np.maximum(tp + fp, 1e-9)
+        rec = tp / np.maximum(tp + fn, 1e-9)
+        f1 = 2 * prec * rec / np.maximum(prec + rec, 1e-9)
+
+    # macro (ignore classes with no support by weighting via mask)
+    support = conf.sum(axis=1)
+    mask = support > 0
+    if mask.any():
+        precision_macro = float(np.mean(prec[mask]))
+        recall_macro = float(np.mean(rec[mask]))
+        f1_macro = float(np.mean(f1[mask]))
+    else:
+        precision_macro = recall_macro = f1_macro = 0.0
+
+    # micro
+    tp_total = float(tp.sum())
+    fp_total = float(fp.sum())
+    fn_total = float(fn.sum())
+    precision_micro = tp_total / max(tp_total + fp_total, 1e-9)
+    recall_micro = tp_total / max(tp_total + fn_total, 1e-9)
+    f1_micro = 2 * precision_micro * recall_micro / max(precision_micro + recall_micro, 1e-9)
+
+    return {
+        "precision_macro": precision_macro,
+        "recall_macro": recall_macro,
+        "f1_macro": f1_macro,
+        "precision_micro": precision_micro,
+        "recall_micro": recall_micro,
+        "f1_micro": f1_micro,
+    }
 
 def average_accuracy(acc_after_exp: Sequence[float]) -> float:
     """
@@ -81,6 +274,32 @@ def average_accuracy(acc_after_exp: Sequence[float]) -> float:
     if n == 0:
         return 0.0
     return float(sum(acc_after_exp) / n)
+
+def average_last_row(acc_matrix: List[List[float]]) -> float:
+    """
+    Average accuracy over tasks after the final experience (mean of last row).
+    """
+    if not acc_matrix:
+        return 0.0
+    last = acc_matrix[-1]
+    if not last:
+        return 0.0
+    return float(sum(last) / len(last))
+
+def average_over_matrix(acc_matrix: List[List[float]]) -> float:
+    """
+    Average of per-row means across the accuracy matrix.
+    Provides a stricter notion of AA that accounts for all seen tasks at each step.
+    """
+    if not acc_matrix:
+        return 0.0
+    row_means: List[float] = []
+    for row in acc_matrix:
+        if row:
+            row_means.append(float(sum(row) / len(row)))
+    if not row_means:
+        return 0.0
+    return float(sum(row_means) / len(row_means))
 
 def compute_forgetting(acc_matrix: List[List[float]]) -> List[float]:
     """

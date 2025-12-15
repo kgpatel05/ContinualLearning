@@ -30,7 +30,9 @@ class SgmConfig:
     # Data-driven init
     use_weight_init: bool = True
     init_samples_per_class: int = 16
-    feature_extractor: FeatureExtractorConfig = field(default_factory=FeatureExtractorConfig)
+    feature_extractor: FeatureExtractorConfig = field(
+        default_factory=lambda: FeatureExtractorConfig(layer="avgpool", flatten=True, detach=True)
+    )
 
     # LoRA
     use_lora: bool = True
@@ -184,7 +186,19 @@ class SgmStrategy(CLStrategy):
                 if not collected[cls]:
                     continue
                 mean_feat = torch.stack(collected[cls], dim=0).mean(dim=0).to(device)
-                scaled = mean_feat / (mean_feat.norm() + 1e-6)
+                # Ensure feature dimensionality matches head input
+                flat = mean_feat.reshape(-1)
+                in_f = head.in_features
+                if flat.numel() != in_f:
+                    if flat.numel() % in_f == 0:
+                        flat = flat.view(in_f, -1).mean(dim=1)
+                    elif flat.numel() > in_f:
+                        flat = flat[:in_f]
+                    else:
+                        pad = torch.zeros(in_f - flat.numel(), device=device, dtype=flat.dtype)
+                        flat = torch.cat([flat, pad], dim=0)
+
+                scaled = flat / (flat.norm() + 1e-6)
                 head.weight.data[cls] = scaled
                 if head.bias is not None:
                     head.bias.data[cls] = 0.0
@@ -217,6 +231,16 @@ class SgmStrategy(CLStrategy):
     def _get_head(self, model: nn.Module) -> nn.Linear:
         head_attr = self.cfg.head_attr
         head = getattr(model, head_attr, None)
-        if head is None or not isinstance(head, nn.Linear):
-            raise ValueError(f"SGM expects model to expose a linear head '{head_attr}'")
-        return head
+        if isinstance(head, nn.Linear):
+            return head
+
+        # Common alt name
+        if hasattr(model, "classifier") and isinstance(model.classifier, nn.Linear):
+            return model.classifier
+
+        # Fallback: search for the last linear module
+        linear_modules = [m for m in model.modules() if isinstance(m, nn.Linear)]
+        if linear_modules:
+            return linear_modules[-1]
+
+        raise ValueError(f"SGM expects a linear head; missing attribute '{head_attr}' and no Linear found.")

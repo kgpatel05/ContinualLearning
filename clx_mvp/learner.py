@@ -208,6 +208,8 @@ class Learner:
         for _ in range(self.epochs):
             for x, y in train_loader:
                 x, y = self.strategy.before_batch(self, x, y)
+                # cache current batch for strategies that may need to recompute forward/backward
+                self._current_batch_inputs = (x, y)
 
                 logits = self.model(x)
                 loss = self.strategy.loss(self, logits, y)
@@ -260,6 +262,7 @@ class Learner:
 
                 self._current_batch_for_buffer = None
                 self._skip_buffer_addition = False
+                self._current_batch_inputs = None
 
                 if hasattr(self.strategy, "after_batch"):
                     try:
@@ -269,11 +272,17 @@ class Learner:
                         self.strategy.after_batch(self, x, y)
 
         t1 = time.perf_counter()
+        # Prefer strategy-specific buffers if present (e.g., Siesta latent buffer)
+        buf_obj = getattr(self.strategy, "latent_buffer", self.buffer)
+        try:
+            buffer_size = len(buf_obj)
+        except Exception:
+            buffer_size = len(self.buffer)
         stats = {
             "exp_id": exp_id,
             "num_updates": num_updates,
             "train_time_sec": t1 - t0,
-            "buffer_size": len(self.buffer),
+            "buffer_size": buffer_size,
         }
         self._last_exp_stats.append(stats)
         return stats

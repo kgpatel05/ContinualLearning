@@ -17,8 +17,10 @@ class LoraLinear(nn.Module):
         self.alpha = float(alpha)
         self.scaling = self.alpha / max(1, self.rank)
 
-        self.A = nn.Linear(base.in_features, self.rank, bias=False)
-        self.B = nn.Linear(self.rank, base.out_features, bias=False)
+        dev = base.weight.device
+        dt = base.weight.dtype
+        self.A = nn.Linear(base.in_features, self.rank, bias=False, device=dev, dtype=dt)
+        self.B = nn.Linear(self.rank, base.out_features, bias=False, device=dev, dtype=dt)
         nn.init.kaiming_uniform_(self.A.weight, a=5 ** 0.5)
         nn.init.zeros_(self.B.weight)
 
